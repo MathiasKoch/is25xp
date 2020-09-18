@@ -1,15 +1,14 @@
 //! External flash driver for IS25xP family
+#![no_std]
 
 pub mod commands;
 
-use embedded_hal::storage::{self, ReadWrite, Region};
-
 // FIXME: Embedded-hal QSPI traits?
+use embedded_hal::storage::{Address, BitSubset, IterableByOverlaps, ReadWrite, Region};
 use stm32l4xx_hal::{
     pac::QUADSPI,
     qspi::{ClkPin, IO0Pin, IO1Pin, IO2Pin, IO3Pin, NCSPin, QspiError, QspiMode},
 };
-use storage::{BitSubset, IterableByOverlaps, Address};
 
 pub struct IS25xP<P> {
     qspi: stm32l4xx_hal::qspi::Qspi<P>,
@@ -93,8 +92,9 @@ where
         }
 
         self.qspi.write(commands::WRITE_ENABLE)?;
-        self.qspi
-            .write(commands::ERASE_SECTOR.address(sector.location().0 as u32, QspiMode::SingleChannel))?;
+        self.qspi.write(
+            commands::ERASE_SECTOR.address(sector.location().0 as u32, QspiMode::SingleChannel),
+        )?;
         self.wait_busy()
     }
 
@@ -105,7 +105,8 @@ where
 
         self.qspi.write(commands::WRITE_ENABLE)?;
         self.qspi.write(
-            commands::ERASE_HALF_BLOCK.address(half_block.location().0 as u32, QspiMode::SingleChannel),
+            commands::ERASE_HALF_BLOCK
+                .address(half_block.location().0 as u32, QspiMode::SingleChannel),
         )?;
         self.wait_busy()
     }
@@ -116,8 +117,9 @@ where
         }
 
         self.qspi.write(commands::WRITE_ENABLE)?;
-        self.qspi
-            .write(commands::ERASE_BLOCK.address(block.location().0 as u32, QspiMode::SingleChannel))?;
+        self.qspi.write(
+            commands::ERASE_BLOCK.address(block.location().0 as u32, QspiMode::SingleChannel),
+        )?;
         self.wait_busy()
     }
 
@@ -125,8 +127,6 @@ where
         Ok(())
     }
 }
-
-
 
 pub struct MemoryMap {}
 pub struct Block(usize);
@@ -168,7 +168,7 @@ impl MemoryMap {
         BASE_ADDRESS
     }
     pub const fn end() -> Address {
-        Address(BASE_ADDRESS.0 + MEMORY_SIZE)
+        Address(BASE_ADDRESS.0 + MEMORY_SIZE as u32)
     }
     pub const fn size() -> usize {
         MEMORY_SIZE
@@ -255,30 +255,34 @@ impl Page {
 
 impl Region for Block {
     fn contains(&self, address: Address) -> bool {
-        let start = Address(BLOCK_SIZE * self.0);
+        let start = Address((BLOCK_SIZE * self.0) as u32);
         (address >= start) && (address < start + BLOCK_SIZE)
     }
 }
 
 impl Region for HalfBlock {
     fn contains(&self, address: Address) -> bool {
-        let start = Address(HALFBLOCK_SIZE * self.0);
+        let start = Address((HALFBLOCK_SIZE * self.0) as u32);
         (address >= start) && (address < start + HALFBLOCK_SIZE)
     }
 }
 
 impl Region for Sector {
     fn contains(&self, address: Address) -> bool {
-        let start = Address(SECTOR_SIZE * self.0);
+        let start = Address((SECTOR_SIZE * self.0) as u32);
         (address >= start) && (address < start + SECTOR_SIZE)
     }
 }
 
 impl Region for Page {
     fn contains(&self, address: Address) -> bool {
-        let start = Address(PAGE_SIZE * self.0);
+        let start = Address((PAGE_SIZE * self.0) as u32);
         (address >= start) && (address < start + PAGE_SIZE)
     }
+}
+
+pub enum Error {
+    PlaceHolder,
 }
 
 impl<CLK, NCS, IO0, IO1, IO2, IO3> ReadWrite for IS25xP<(CLK, NCS, IO0, IO1, IO2, IO3)>
@@ -290,23 +294,26 @@ where
     IO2: IO2Pin<QUADSPI>,
     IO3: IO3Pin<QUADSPI>,
 {
-    type Error = ();
+    type Error = Error;
 
-    fn read(&mut self, address: Address, bytes: &mut [u8]) -> nb::Result<(), Self::Error> {
-        Ok(self.read_native(address, bytes).map_err(|_| ())?)
+    fn try_read(&mut self, address: Address, bytes: &mut [u8]) -> nb::Result<(), Self::Error> {
+        Ok(self
+            .read_native(address, bytes)
+            .map_err(|_| Error::PlaceHolder)?)
     }
 
-    fn write(&mut self, address: Address, bytes: &[u8]) -> nb::Result<(), Self::Error> {
+    fn try_write(&mut self, address: Address, bytes: &[u8]) -> nb::Result<(), Self::Error> {
         for (data, sector, address) in MemoryMap::sectors().overlaps(bytes, address) {
             let offset_into_sector = address.0.saturating_sub(sector.location().0) as usize;
             let mut merge_buffer = [0x00u8; SECTOR_SIZE];
-            self.read(sector.location(), &mut merge_buffer)?;
+            self.try_read(sector.location(), &mut merge_buffer)?;
             if data.is_subset_of(&merge_buffer[offset_into_sector..]) {
                 for (data, page, address) in sector.pages().overlaps(data, address) {
-                    self.write_page(&page, data, address).map_err(|_| ())?;
+                    self.write_page(&page, data, address)
+                        .map_err(|_| Error::PlaceHolder)?;
                 }
             } else {
-                self.erase_sector(&sector).map_err(|_| ())?;
+                self.erase_sector(&sector).map_err(|_| Error::PlaceHolder)?;
                 merge_buffer
                     .iter_mut()
                     .skip(offset_into_sector)
@@ -315,7 +322,8 @@ where
                 for (data, page, address) in
                     sector.pages().overlaps(&merge_buffer, sector.location())
                 {
-                    self.write_page(&page, data, address).map_err(|_| ())?;
+                    self.write_page(&page, data, address)
+                        .map_err(|_| Error::PlaceHolder)?;
                 }
             }
         }
@@ -327,7 +335,7 @@ where
         (MemoryMap::location(), MemoryMap::end())
     }
 
-    fn erase(&mut self) -> nb::Result<(), Self::Error> {
-        Ok(self.erase_chip().map_err(|_| ())?)
+    fn try_erase(&mut self) -> nb::Result<(), Self::Error> {
+        Ok(self.erase_chip().map_err(|_| Error::PlaceHolder)?)
     }
 }
