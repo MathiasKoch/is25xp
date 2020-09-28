@@ -11,5 +11,10 @@ embedded-hal = { git = "https://github.com/MathiasKoch/embedded-hal", branch = "
 stm32l4xx-hal = { version = "0.5.0", features = ["stm32l4x5", "rt"] }
 nb = "1.0.0"
 
+[dev-dependencies]
+cortex-m = { version = "0.6.3"}
+cortex-m-rtic = { version = "0.5.5"}
+rtt-target = { version = "0.2.2", features = ["cortex-m"] }
+
 [patch.crates-io]
 stm32l4xx-hal = { git = "https://github.com/MathiasKoch/stm32l4xx-hal", branch = "factbird-mini" }
