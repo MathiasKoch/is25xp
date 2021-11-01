@@ -1,10 +1,19 @@
 //! External flash driver for IS25xP family
-#![no_std]
+
+#![cfg_attr(not(test), no_std)]
 
 pub mod commands;
+// mod flash_params;
+mod status;
 
-// FIXME: Embedded-hal QSPI traits?
-use embedded_hal::storage::{Address, BitSubset, IterableByOverlaps, ReadWrite, Region};
+#[cfg(test)]
+mod tests;
+
+use embedded_storage::{
+    nor_flash::{MultiwriteNorFlash, NorFlash, ReadNorFlash},
+    Region,
+};
+use status::{Status, QE};
 use stm32l4xx_hal::{
     pac::QUADSPI,
     qspi::{
@@ -45,7 +54,9 @@ where
 pub enum Error {
     Busy,
     Qspi,
-    Unknown,
+    OutOfBounds,
+    Alignment,
+    Size,
 }
 
 pub struct IS25xP<Q> {
@@ -59,18 +70,14 @@ where
     pub fn try_new(qspi: Q) -> Result<Self, Error> {
         let flash = IS25xP { qspi };
         flash.wait_busy()?;
-        let mut sr_arr: [u8; 1] = [0];
-        // flash.qspi.transfer(commands::GET_STATUS, &mut sr_arr)?;
-
         // Set quad enable bit
-        sr_arr[0] = sr_arr[0] | 0x40;
         flash
             .qspi
-            .write(commands::WRITE_STATUS.data(&sr_arr, QspiMode::SingleChannel))
+            .write(commands::WRITE_STATUS.data(&[QE], QspiMode::SingleChannel))
             .map_err(|_| Error::Qspi)?;
 
         // Apply QPI mode - This feature does not work..
-        // flash.qspi.write(commands::QPI_ENABLE)?;
+        // flash.qspi.write(commands::QPI_ENABLE).map_err(|_| Error::Qspi)?;
         // flash
         //     .qspi
         //     .apply_config(flash.qspi.get_config().qpi_mode(true));
@@ -78,40 +85,40 @@ where
         Ok(flash)
     }
 
-    fn is_busy(&self) -> Result<bool, Error> {
-        let mut sr_arr: [u8; 1] = [1];
+    fn status(&self) -> Result<Status, Error> {
+        let mut sr_arr = [1u8; 1];
         self.qspi
             .transfer(commands::GET_STATUS, &mut sr_arr)
             .map_err(|_| Error::Qspi)?;
 
-        Ok(sr_arr[0] & 1 == 1)
+        Ok(sr_arr[0].into())
     }
 
     fn wait_busy(&self) -> Result<(), Error> {
-        while self.is_busy()? {}
+        while self.status()?.wip() {}
         Ok(())
     }
 
-    fn read_native(&self, address: Address, data: &mut [u8]) -> Result<(), Error> {
+    pub fn read_native(&self, offset: u32, data: &mut [u8]) -> Result<(), Error> {
         self.wait_busy()?;
 
         self.qspi
             .transfer(
                 commands::QUAD_READ
-                    .address(address.0 as u32, QspiMode::QuadChannel)
+                    .address(offset, QspiMode::QuadChannel)
                     .receive_length(data.len() as u32),
                 data,
             )
             .map_err(|_| Error::Qspi)
     }
 
-    fn write_page(&self, page: &Page, data: &[u8], address: Address) -> Result<(), Error> {
-        if self.is_busy()? {
+    pub fn write_page(&self, offset: u32, data: &[u8]) -> Result<(), Error> {
+        if self.status()?.wip() {
             return Err(Error::Busy);
         }
 
-        if data.len() > 256 {
-            return Err(Error::Unknown);
+        if data.len() > PAGE_SIZE as usize {
+            return Err(Error::Size);
         }
 
         self.qspi
@@ -120,7 +127,7 @@ where
         self.qspi
             .write(
                 commands::QUAD_WRITE
-                    .address(address.0 as u32, QspiMode::SingleChannel)
+                    .address(offset, QspiMode::SingleChannel)
                     .data(data, QspiMode::QuadChannel),
             )
             .map_err(|_| Error::Qspi)?;
@@ -128,8 +135,8 @@ where
         self.wait_busy()
     }
 
-    fn erase_sector(&self, sector: &Sector) -> Result<(), Error> {
-        if self.is_busy()? {
+    pub fn erase_sector(&self, sector: &Sector) -> Result<(), Error> {
+        if self.status()?.wip() {
             return Err(Error::Busy);
         }
 
@@ -137,15 +144,13 @@ where
             .write(commands::WRITE_ENABLE)
             .map_err(|_| Error::Qspi)?;
         self.qspi
-            .write(
-                commands::ERASE_SECTOR.address(sector.location().0 as u32, QspiMode::SingleChannel),
-            )
+            .write(commands::ERASE_SECTOR.address(sector.start(), QspiMode::SingleChannel))
             .map_err(|_| Error::Qspi)?;
         self.wait_busy()
     }
 
-    fn erase_halfblock(&self, half_block: &HalfBlock) -> Result<(), Error> {
-        if self.is_busy()? {
+    pub fn erase_halfblock(&self, half_block: &HalfBlock) -> Result<(), Error> {
+        if self.status()?.wip() {
             return Err(Error::Busy);
         }
 
@@ -153,16 +158,13 @@ where
             .write(commands::WRITE_ENABLE)
             .map_err(|_| Error::Qspi)?;
         self.qspi
-            .write(
-                commands::ERASE_HALF_BLOCK
-                    .address(half_block.location().0 as u32, QspiMode::SingleChannel),
-            )
+            .write(commands::ERASE_HALF_BLOCK.address(half_block.start(), QspiMode::SingleChannel))
             .map_err(|_| Error::Qspi)?;
         self.wait_busy()
     }
 
-    fn erase_block(&self, block: &Block) -> Result<(), Error> {
-        if self.is_busy()? {
+    pub fn erase_block(&self, block: &Block) -> Result<(), Error> {
+        if self.status()?.wip() {
             return Err(Error::Busy);
         }
 
@@ -170,40 +172,48 @@ where
             .write(commands::WRITE_ENABLE)
             .map_err(|_| Error::Qspi)?;
         self.qspi
-            .write(
-                commands::ERASE_BLOCK.address(block.location().0 as u32, QspiMode::SingleChannel),
-            )
+            .write(commands::ERASE_BLOCK.address(block.start(), QspiMode::SingleChannel))
             .map_err(|_| Error::Qspi)?;
         self.wait_busy()
     }
 
-    fn erase_chip(&self) -> Result<(), Error> {
-        Ok(())
+    pub fn erase_chip(&self) -> Result<(), Error> {
+        if self.status()?.wip() {
+            return Err(Error::Busy);
+        }
+
+        self.qspi
+            .write(commands::WRITE_ENABLE)
+            .map_err(|_| Error::Qspi)?;
+        self.qspi
+            .write(commands::ERASE_CHIP)
+            .map_err(|_| Error::Qspi)?;
+        self.wait_busy()
     }
 }
 
-pub struct MemoryMap {}
-pub struct Block(usize);
-pub struct HalfBlock(usize);
-pub struct Sector(usize);
-pub struct Page(usize);
+pub struct MemoryMap;
+pub struct Block(u32);
+pub struct HalfBlock(u32);
+pub struct Sector(u32);
+pub struct Page(u32);
 
-const BASE_ADDRESS: Address = Address(0x0000_0000);
-const PAGES_PER_SECTOR: usize = 16;
-const SECTORS_PER_BLOCK: usize = 16;
-const SECTORS_PER_HALFBLOCK: usize = 8;
-const HALFBLOCKS_PER_BLOCK: usize = SECTORS_PER_BLOCK / SECTORS_PER_HALFBLOCK;
-const PAGES_PER_BLOCK: usize = PAGES_PER_SECTOR * SECTORS_PER_BLOCK;
-const PAGES_PER_HALFBLOCK: usize = PAGES_PER_SECTOR * HALFBLOCKS_PER_BLOCK;
-const PAGE_SIZE: usize = 256;
-const SECTOR_SIZE: usize = PAGE_SIZE * PAGES_PER_SECTOR;
-const HALFBLOCK_SIZE: usize = SECTOR_SIZE * SECTORS_PER_HALFBLOCK;
-const BLOCK_SIZE: usize = SECTOR_SIZE * SECTORS_PER_BLOCK;
-const MEMORY_SIZE: usize = NUMBER_OF_BLOCKS * BLOCK_SIZE;
-const NUMBER_OF_BLOCKS: usize = 256;
-const NUMBER_OF_HALFBLOCKS: usize = NUMBER_OF_BLOCKS * HALFBLOCKS_PER_BLOCK;
-const NUMBER_OF_SECTORS: usize = NUMBER_OF_BLOCKS * SECTORS_PER_BLOCK;
-const NUMBER_OF_PAGES: usize = NUMBER_OF_SECTORS * PAGES_PER_SECTOR;
+const BASE_ADDRESS: u32 = 0x0000_0000;
+const PAGES_PER_SECTOR: u32 = 16;
+const SECTORS_PER_BLOCK: u32 = 16;
+const SECTORS_PER_HALFBLOCK: u32 = 8;
+const HALFBLOCKS_PER_BLOCK: u32 = SECTORS_PER_BLOCK / SECTORS_PER_HALFBLOCK;
+const PAGES_PER_BLOCK: u32 = PAGES_PER_SECTOR * SECTORS_PER_BLOCK;
+const PAGES_PER_HALFBLOCK: u32 = PAGES_PER_SECTOR * HALFBLOCKS_PER_BLOCK;
+const PAGE_SIZE: u32 = 256;
+const SECTOR_SIZE: u32 = PAGE_SIZE * PAGES_PER_SECTOR;
+const HALFBLOCK_SIZE: u32 = SECTOR_SIZE * SECTORS_PER_HALFBLOCK;
+const BLOCK_SIZE: u32 = SECTOR_SIZE * SECTORS_PER_BLOCK;
+const MEMORY_SIZE: u32 = NUMBER_OF_BLOCKS * BLOCK_SIZE;
+const NUMBER_OF_BLOCKS: u32 = 256;
+const NUMBER_OF_HALFBLOCKS: u32 = NUMBER_OF_BLOCKS * HALFBLOCKS_PER_BLOCK;
+const NUMBER_OF_SECTORS: u32 = NUMBER_OF_BLOCKS * SECTORS_PER_BLOCK;
+const NUMBER_OF_PAGES: u32 = NUMBER_OF_SECTORS * PAGES_PER_SECTOR;
 
 impl MemoryMap {
     pub fn blocks() -> impl Iterator<Item = Block> {
@@ -218,14 +228,14 @@ impl MemoryMap {
     pub fn pages() -> impl Iterator<Item = Page> {
         (0..NUMBER_OF_PAGES).map(Page)
     }
-    pub const fn location() -> Address {
+    pub const fn start() -> u32 {
         BASE_ADDRESS
     }
-    pub const fn end() -> Address {
-        Address(BASE_ADDRESS.0 + MEMORY_SIZE as u32)
+    pub const fn end() -> u32 {
+        BASE_ADDRESS + MEMORY_SIZE as u32
     }
     pub const fn size() -> usize {
-        MEMORY_SIZE
+        MEMORY_SIZE as usize
     }
 }
 
@@ -239,38 +249,38 @@ impl Block {
     pub fn pages(&self) -> impl Iterator<Item = Page> {
         ((self.0 * PAGES_PER_BLOCK)..((1 + self.0) * PAGES_PER_BLOCK)).map(Page)
     }
-    pub fn location(&self) -> Address {
-        BASE_ADDRESS + self.0 * Self::size()
+    pub fn start(&self) -> u32 {
+        BASE_ADDRESS + self.0 * Self::size() as u32
     }
-    pub fn end(&self) -> Address {
-        self.location() + Self::size()
+    pub fn end(&self) -> u32 {
+        self.start() + Self::size() as u32
     }
-    pub fn at(address: Address) -> Option<Self> {
+    pub fn at(address: u32) -> Option<Self> {
         MemoryMap::blocks().find(|s| s.contains(address))
     }
     pub const fn size() -> usize {
-        SECTOR_SIZE
+        BLOCK_SIZE as usize
     }
 }
 
 impl HalfBlock {
     pub fn sectors(&self) -> impl Iterator<Item = Sector> {
-        ((self.0 * SECTORS_PER_BLOCK)..((1 + self.0) * SECTORS_PER_BLOCK)).map(Sector)
+        ((self.0 * SECTORS_PER_HALFBLOCK)..((1 + self.0) * SECTORS_PER_HALFBLOCK)).map(Sector)
     }
     pub fn pages(&self) -> impl Iterator<Item = Page> {
         ((self.0 * PAGES_PER_HALFBLOCK)..((1 + self.0) * PAGES_PER_HALFBLOCK)).map(Page)
     }
-    pub fn location(&self) -> Address {
-        BASE_ADDRESS + self.0 * Self::size()
+    pub fn start(&self) -> u32 {
+        BASE_ADDRESS + self.0 * Self::size() as u32
     }
-    pub fn end(&self) -> Address {
-        self.location() + Self::size()
+    pub fn end(&self) -> u32 {
+        self.start() + Self::size() as u32
     }
-    pub fn at(address: Address) -> Option<Self> {
+    pub fn at(address: u32) -> Option<Self> {
         MemoryMap::halfblocks().find(|s| s.contains(address))
     }
     pub const fn size() -> usize {
-        SECTOR_SIZE
+        HALFBLOCK_SIZE as usize
     }
 }
 
@@ -278,102 +288,147 @@ impl Sector {
     pub fn pages(&self) -> impl Iterator<Item = Page> {
         ((self.0 * PAGES_PER_SECTOR)..((1 + self.0) * PAGES_PER_SECTOR)).map(Page)
     }
-    pub fn location(&self) -> Address {
-        BASE_ADDRESS + self.0 * Self::size()
+    pub fn start(&self) -> u32 {
+        BASE_ADDRESS + self.0 * Self::size() as u32
     }
-    pub fn end(&self) -> Address {
-        self.location() + Self::size()
+    pub fn end(&self) -> u32 {
+        self.start() + Self::size() as u32
     }
-    pub fn at(address: Address) -> Option<Self> {
+    pub fn at(address: u32) -> Option<Self> {
         MemoryMap::sectors().find(|s| s.contains(address))
     }
     pub const fn size() -> usize {
-        SECTOR_SIZE
+        SECTOR_SIZE as usize
     }
 }
 
 impl Page {
-    pub fn location(&self) -> Address {
-        BASE_ADDRESS + self.0 * Self::size()
+    pub fn start(&self) -> u32 {
+        BASE_ADDRESS + self.0 * Self::size() as u32
     }
-    pub fn end(&self) -> Address {
-        self.location() + Self::size()
+    pub fn end(&self) -> u32 {
+        self.start() + Self::size() as u32
     }
-    pub fn at(address: Address) -> Option<Self> {
+    pub fn at(address: u32) -> Option<Self> {
         MemoryMap::pages().find(|s| s.contains(address))
     }
     pub const fn size() -> usize {
-        PAGE_SIZE
+        PAGE_SIZE as usize
     }
 }
 
 impl Region for Block {
-    fn contains(&self, address: Address) -> bool {
-        let start = Address((BLOCK_SIZE * self.0) as u32);
-        (address >= start) && (address < start + BLOCK_SIZE)
+    fn contains(&self, address: u32) -> bool {
+        let start = BLOCK_SIZE * self.0;
+        (start <= address) && (address < start + BLOCK_SIZE)
     }
 }
 
 impl Region for HalfBlock {
-    fn contains(&self, address: Address) -> bool {
-        let start = Address((HALFBLOCK_SIZE * self.0) as u32);
-        (address >= start) && (address < start + HALFBLOCK_SIZE)
+    fn contains(&self, address: u32) -> bool {
+        let start = HALFBLOCK_SIZE * self.0;
+        (start <= address) && (address < start + HALFBLOCK_SIZE)
     }
 }
 
 impl Region for Sector {
-    fn contains(&self, address: Address) -> bool {
-        let start = Address((SECTOR_SIZE * self.0) as u32);
-        (address >= start) && (address < start + SECTOR_SIZE)
+    fn contains(&self, address: u32) -> bool {
+        let start = SECTOR_SIZE * self.0;
+        (start <= address) && (address < start + SECTOR_SIZE)
     }
 }
 
 impl Region for Page {
-    fn contains(&self, address: Address) -> bool {
-        let start = Address((PAGE_SIZE * self.0) as u32);
-        (address >= start) && (address < start + PAGE_SIZE)
+    fn contains(&self, address: u32) -> bool {
+        let start = PAGE_SIZE * self.0;
+        (start <= address) && (address < start + PAGE_SIZE)
     }
 }
 
-impl<Q: Qspi> ReadWrite for IS25xP<Q> {
+impl<Q: Qspi> ReadNorFlash for IS25xP<Q> {
     type Error = Error;
 
-    fn try_read(&mut self, address: Address, bytes: &mut [u8]) -> nb::Result<(), Self::Error> {
-        Ok(self.read_native(address, bytes)?)
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        if offset > self.capacity() as u32 {
+            return Err(Error::OutOfBounds);
+        }
+
+        self.read_native(offset, bytes)
     }
 
-    fn try_write(&mut self, address: Address, bytes: &[u8]) -> nb::Result<(), Self::Error> {
-        for (data, sector, address) in MemoryMap::sectors().overlaps(bytes, address) {
-            let offset_into_sector = address.0.saturating_sub(sector.location().0) as usize;
-            let mut merge_buffer = [0x00u8; SECTOR_SIZE];
-            self.try_read(sector.location(), &mut merge_buffer)?;
-            if data.is_subset_of(&merge_buffer[offset_into_sector..]) {
-                for (data, page, address) in sector.pages().overlaps(data, address) {
-                    self.write_page(&page, data, address)?;
-                }
-            } else {
-                self.erase_sector(&sector)?;
-                merge_buffer
-                    .iter_mut()
-                    .skip(offset_into_sector)
-                    .zip(data)
-                    .for_each(|(byte, input)| *byte = *input);
-                for (data, page, address) in
-                    sector.pages().overlaps(&merge_buffer, sector.location())
-                {
-                    self.write_page(&page, data, address)?;
-                }
-            }
+    fn capacity(&self) -> usize {
+        MemoryMap::size()
+    }
+}
+
+impl<Q: Qspi> NorFlash for IS25xP<Q> {
+    const WRITE_SIZE: usize = 1;
+
+    const ERASE_SIZE: usize = SECTOR_SIZE as usize;
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        if offset as usize + bytes.len() > self.capacity() {
+            return Err(Error::OutOfBounds);
+        }
+
+        let mut alignment_offset = 0;
+        let mut aligned_address = MemoryMap::start() + offset;
+
+        if offset % PAGE_SIZE != 0 {
+            alignment_offset = core::cmp::min(PAGE_SIZE - offset % PAGE_SIZE, bytes.len() as u32);
+            self.write_page(aligned_address, &bytes[..alignment_offset as usize])?;
+
+            aligned_address += alignment_offset;
+        }
+
+        let mut chunks = bytes[alignment_offset as usize..].chunks_exact(PAGE_SIZE as usize);
+        for exact_chunk in &mut chunks {
+            self.write_page(aligned_address, exact_chunk)?;
+            aligned_address += PAGE_SIZE;
+        }
+
+        let remainder = chunks.remainder();
+        if !remainder.is_empty() {
+            self.write_page(aligned_address, remainder)?;
         }
 
         Ok(())
     }
 
-    fn range(&self) -> (Address, Address) {
-        (MemoryMap::location(), MemoryMap::end())
-    }
+    fn erase(&mut self, mut from: u32, to: u32) -> Result<(), Self::Error> {
+        // Check that from & to is properly aligned to a proper erase resolution
+        if to % Self::ERASE_SIZE as u32 != 0 || from % Self::ERASE_SIZE as u32 != 0 {
+            return Err(Error::Alignment);
+        }
 
-    fn try_erase(&mut self) -> nb::Result<(), Self::Error> {
-        Ok(self.erase_chip()?)
+        // Shortcut to erase entire chip
+        if MemoryMap::start() == from && MemoryMap::end() == to {
+            return self.erase_chip();
+        }
+
+        while from < to {
+            if from % BLOCK_SIZE == 0 && from + BLOCK_SIZE <= to {
+                let block = Block::at(from).ok_or(Error::OutOfBounds)?;
+                self.erase_block(&block)?;
+                from += BLOCK_SIZE;
+            } else if from % HALFBLOCK_SIZE == 0 && from + HALFBLOCK_SIZE <= to {
+                let halfblock = HalfBlock::at(from).ok_or(Error::OutOfBounds)?;
+                self.erase_halfblock(&halfblock)?;
+                from += HALFBLOCK_SIZE;
+            } else {
+                let sector = Sector::at(from).ok_or(Error::OutOfBounds)?;
+                self.erase_sector(&sector)?;
+                from += SECTOR_SIZE;
+            }
+        }
+
+        Ok(())
     }
 }
+
+/// Note: A program operation can alter “1”s into “0”s. The same byte location
+/// or page may be programmed more than once, to incrementally change “1”s to
+/// “0”s. An erase operation is required to change “0”s to “1”s.
+impl<Q: Qspi> MultiwriteNorFlash for IS25xP<Q> {}

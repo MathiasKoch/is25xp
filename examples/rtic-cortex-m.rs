@@ -6,7 +6,6 @@ use cortex_m::peripheral::DWT;
 use rtic::app;
 use rtt_target::{rprintln, rtt_init_print};
 
-use embedded_hal::storage::ReadWrite;
 use is25xp::IS25xP;
 use stm32l4xx_hal::{
     gpio::{
@@ -93,7 +92,6 @@ const APP: () = {
         };
 
         rprintln!("[Init] Success!");
-
 
         ctx.spawn.flash_test().unwrap();
 
