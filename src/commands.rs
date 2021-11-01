@@ -75,6 +75,15 @@ pub const QUAD_READ: QspiReadCommand = QspiReadCommand {
     double_data_rate: false,
 };
 
+pub const ERASE_CHIP: QspiWriteCommand = QspiWriteCommand {
+    instruction: Some((0xC7, QspiMode::SingleChannel)),
+    address: None,
+    alternative_bytes: None,
+    dummy_cycles: 0,
+    data: None,
+    double_data_rate: false,
+};
+
 pub const ERASE_BLOCK: QspiWriteCommand = QspiWriteCommand {
     instruction: Some((0xD8, QspiMode::SingleChannel)),
     address: Some((0, QspiMode::SingleChannel)),
